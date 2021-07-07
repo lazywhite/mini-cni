@@ -1,0 +1,69 @@
+#!/bin/bash 
+
+DEFAULT_BR=dummy0
+
+ensure_br () {
+    target="$1/24"
+    ip link show ${DEFAULT_BR} > /dev/null 2>&1
+    if [ $? -ne 0 ];then
+        ip link add name ${DEFAULT_BR} type bridge
+        ip link set ${DEFAULT_BR} up
+        ip addr add $target dev ${DEFAULT_BR}
+    fi
+
+    current=$(ip -o addr show kube-bridge |grep  'inet[^6]'|awk '{print $4}')
+    if [ $current !=  $target ];then
+        ip addr flush dev ${DEFAULT_BR}
+        ip addr add $target dev ${DEFAULT_BR}
+    fi
+}
+
+allocate_ip () {
+     last=$((1 + $RANDOM % 254))
+     ip=$(echo $1|sed 's:0/24::')$last
+     echo $ip
+}
+
+case $CNI_COMMAND in
+ADD)
+    # json最后一行不能以,结尾
+    cidr=$(cat /dev/stdin|jq -r ".podcidr")
+    gw=$(echo $cidr|sed 's:0/24:1:')
+    ensure_br $gw
+
+    ip=$(allocate_ip $cidr)
+    
+    host_ifname="veth-$PID"
+    peer_ifname=${host_ifname}-peer
+    ip link add $host_ifname type veth peer name $peer_ifname
+    ip link set $host_ifname up
+    ip link set $host_ifname master ${DEFAULT_BR}
+    
+    ln -sfT $CNI_NETNS /var/run/netns/$CNI_CONTAINERID
+    ip link set $peer_ifname netns $CNI_CONTAINERID
+    # lo already set up by pause image
+    ip netns exec $CNI_CONTAINERID ip link set $peer_ifname name $CNI_IFNAME
+    ip netns exec $CNI_CONTAINERID ip link set $CNI_IFNAME up
+    ip netns exec $CNI_CONTAINERID ip addr add $ip dev $CNI_IFNAME
+    ip netns exec $CNI_CONTAINERID ip route add $cidr dev $CNI_IFNAME
+    ip netns exec $CNI_CONTAINERID ip route add default via $gw dev $CNI_IFNAME
+;;
+DEL)
+    docker stop $CNI_CONTAINERID
+    ip netns del $CNI_CONTAINERID
+;;
+VERSION)
+cat<<EOF
+{
+    "cniVersion": "0.1.1"
+}
+EOF
+;;
+CHECK)
+cat<<EOF
+{
+    "cniVersion": "0.1.1"
+}
+EOF
+;;
+esac
